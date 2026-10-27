@@ -54,7 +54,7 @@ export function ModelCritique({
   if (!status.modelConfigured) {
     return (
       <p className="meta">
-        Model critique is off. Set <span className="mono">XAI_API_KEY</span> on the server if you want a second
+        Model critique is off. Set <span className="mono">GEMINI_API_KEY</span> on the server if you want a second
         opinion. The workflow on this page does not use a model.
       </p>
     );

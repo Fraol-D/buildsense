@@ -5,8 +5,8 @@ export async function GET(request: Request) {
   void request.headers.get("accept");
   return Response.json(
     modelStatus({
-      apiKey: process.env.XAI_API_KEY,
-      model: process.env.XAI_MODEL,
+      apiKey: process.env.GEMINI_API_KEY,
+      model: process.env.GEMINI_MODEL,
     }),
   );
 }

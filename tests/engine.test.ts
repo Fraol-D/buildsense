@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { handleCoachRequest, parseCritique } from "@/lib/ai/coach";
+import { ApiError } from "@google/genai";
+import { DEFAULT_MODEL, handleCoachRequest, parseCritique, type GenerateCritiqueInput } from "@/lib/ai/coach";
 import type { EngineOptions, Project } from "@/lib/domain/types";
 import { generateBriefs } from "@/lib/engine/briefs";
 import { generateDecisions } from "@/lib/engine/decisions";
@@ -228,69 +229,124 @@ describe("example project", () => {
   });
 });
 
-describe("model critique boundary", () => {
-  it("stays unavailable without a key and does not echo a key when a call fails", async () => {
-    const missing = await handleCoachRequest(
-      JSON.stringify({ task: "critique_definition", context: "Project notes." }),
-      {},
-    );
-    expect(missing.status).toBe(503);
-    expect(JSON.stringify(missing.body)).not.toContain("verified");
+const validCritique = JSON.stringify({
+  commentary: "The access rule is still missing. Do not pretend it exists.",
+  suggestions: [
+    {
+      kind: "open_question",
+      text: "Who is rejected when they ask for someone else's note?",
+      impact: "high",
+      why: "The notes are described as private.",
+    },
+  ],
+});
 
-    const secret = "xai-test-secret-value";
-    const failed = await handleCoachRequest(
-      JSON.stringify({ task: "review_evidence", context: "Evidence pasted by the user." }),
-      {
-        apiKey: secret,
-        fetchImpl: async () =>
-          new Response(JSON.stringify({ error: `leaked ${secret}` }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" },
-          }),
+describe("Gemini critique boundary", () => {
+  it("stays unavailable without a key and does not invent a critique", async () => {
+    let called = false;
+    const missing = await handleCoachRequest(JSON.stringify({ task: "critique_definition", context: "Project notes." }), {
+      generate: async () => {
+        called = true;
+        return validCritique;
       },
-    );
-    expect(failed.status).toBe(502);
-    expect(JSON.stringify(failed.body)).not.toContain(secret);
+    });
+    expect(missing.status).toBe(503);
+    expect(missing.body.error).toBe("model_not_configured");
+    expect(JSON.stringify(missing.body)).toContain("GEMINI_API_KEY");
+    expect(JSON.stringify(missing.body)).not.toContain("verified");
+    expect(missing.body).not.toHaveProperty("critique");
+    expect(called).toBe(false);
   });
 
-  it("returns a critique without a verification status", async () => {
-    const response = await handleCoachRequest(
-      JSON.stringify({ task: "probe", context: "The user has not named an access rule." }),
-      {
-        apiKey: "test-key",
-        fetchImpl: async (_input, init) => {
-          const body = JSON.parse(String(init?.body));
-          expect(body.model).toBe("grok-4.7");
-          expect(body.messages[0].content).toContain("Never say that a requirement is verified");
-          return new Response(
-            JSON.stringify({
-              choices: [
-                {
-                  message: {
-                    content: JSON.stringify({
-                      commentary: "The access rule is still missing. Do not pretend it exists.",
-                      suggestions: [
-                        {
-                          kind: "open_question",
-                          text: "Who is rejected when they ask for someone else's note?",
-                          impact: "high",
-                          why: "The notes are described as private.",
-                        },
-                      ],
-                    }),
-                  },
-                },
-              ],
-            }),
-            { status: 200, headers: { "Content-Type": "application/json" } },
-          );
-        },
+  it("hides provider failures, including a leaked key, quota, and an invalid key", async () => {
+    const secret = "gemini-test-secret-value";
+    const leaked = await handleCoachRequest(JSON.stringify({ task: "review_evidence", context: "Evidence pasted by the user." }), {
+      apiKey: secret,
+      generate: async () => {
+        throw new ApiError({ message: `request failed for ${secret}`, status: 500 });
       },
-    );
+    });
+    expect(leaked.status).toBe(502);
+    expect(leaked.body).not.toHaveProperty("critique");
+    expect(JSON.stringify(leaked.body)).not.toContain(secret);
+
+    const quota = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
+      apiKey: secret,
+      generate: async () => {
+        throw new ApiError({ message: "RESOURCE_EXHAUSTED", status: 429 });
+      },
+    });
+    expect(quota.status).toBe(429);
+    expect(quota.body.error).toBe("rate_limited");
+    expect(quota.body).not.toHaveProperty("critique");
+
+    const invalid = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
+      apiKey: secret,
+      generate: async () => {
+        throw new ApiError({ message: "API key not valid", status: 400 });
+      },
+    });
+    expect(invalid.status).toBe(401);
+    expect(invalid.body.error).toBe("invalid_api_key");
+    expect(JSON.stringify(invalid.body)).not.toContain(secret);
+
+    const rejected = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
+      apiKey: secret,
+      generate: async () => {
+        throw new ApiError({ message: "permission denied", status: 403 });
+      },
+    });
+    expect(rejected.status).toBe(401);
+    expect(rejected.body.error).toBe("invalid_api_key");
+
+    const timedOut = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
+      apiKey: secret,
+      generate: async () => {
+        const error = new Error("The operation was aborted");
+        error.name = "TimeoutError";
+        throw error;
+      },
+    });
+    expect(timedOut.status).toBe(502);
+    expect(timedOut.body.error).toBe("model_unreachable");
+  });
+
+  it("rejects an unusable model payload and accepts a schema-valid critique", async () => {
+    const invalid = await handleCoachRequest(JSON.stringify({ task: "probe", context: "The user has not named an access rule." }), {
+      apiKey: "test-key",
+      generate: async () => "not json",
+    });
+    expect(invalid.status).toBe(422);
+    expect(invalid.body.error).toBe("model_output_invalid");
+    expect(invalid.body).not.toHaveProperty("critique");
+
+    let seen: GenerateCritiqueInput | undefined;
+    const response = await handleCoachRequest(JSON.stringify({ task: "probe", context: "The user has not named an access rule." }), {
+      apiKey: "test-key",
+      generate: async (input) => {
+        seen = input;
+        return validCritique;
+      },
+    });
+    expect(seen?.model).toBe(DEFAULT_MODEL);
+    expect(seen?.model).toBe("gemini-3.8-flash");
+    expect(seen?.systemInstruction).toContain("Never say that a requirement is verified");
+    expect(seen?.apiKey).toBe("test-key");
     expect(response.status).toBe(200);
     expect(response.body).not.toHaveProperty("status");
     const critique = response.body.critique as { suggestions: { kind: string }[] };
     expect(critique.suggestions[0]?.kind).toBe("open_question");
     expect(parseCritique("not json")).toBeNull();
+  });
+
+  it("discards model text that contains the API key", async () => {
+    const secret = "gemini-test-secret-value";
+    const response = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
+      apiKey: secret,
+      generate: async () => `${validCritique} ${secret}`,
+    });
+    expect(response.status).toBe(502);
+    expect(JSON.stringify(response.body)).not.toContain(secret);
+    expect(response.body).not.toHaveProperty("critique");
   });
 });

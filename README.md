@@ -35,13 +35,13 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
-Optional model critique:
+Optional model critique uses the Gemini API. Create a key at [Google AI Studio](https://aistudio.google.com/apikey), copy `.env.example` to `.env.local`, and set:
 
 ```bash
-cp .env.example .env.local
+GEMINI_API_KEY=your_key_here
 ```
 
-Set `XAI_API_KEY` in `.env.local`. Restart the dev server. The default model is `grok-4.7`. Override it with `XAI_MODEL` if needed. The key is read only on the server.
+Restart the dev server. The default model is `gemini-3.8-flash`. Set `GEMINI_MODEL` in `.env.local` to use another model. The key is read only on the server. `.env.local` is gitignored.
 
 ## Scripts
 

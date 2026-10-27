@@ -255,5 +255,5 @@ export interface ModelStatus {
   persistence: "browser-local";
   modelConfigured: boolean;
   model: string | null;
-  provider: "xai";
+  provider: "gemini";
 }

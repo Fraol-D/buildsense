@@ -31,7 +31,7 @@ Release readiness is one of four named judgments. There is no confidence score.
 
 ## Model critique
 
-When `XAI_API_KEY` is set, `/api/coach` calls the xAI API (`https://api.x.ai/v1/chat/completions`) with model `grok-4.7` unless `XAI_MODEL` overrides it. The key stays on the server. Output must match a JSON schema and is validated with Zod before it reaches the client. Suggestions are added to the record only when the user accepts them, and they are labeled as model critique rather than facts.
+When `GEMINI_API_KEY` is set, `/api/coach` calls the Gemini API through the `@google/genai` SDK. The default model is `gemini-3.8-flash` unless `GEMINI_MODEL` overrides it. The key stays on the server. Output must match the critique schema and is validated with Zod before it reaches the client. Suggestions are added to the record only when the user accepts them, and they are labeled as model critique rather than facts.
 
 If the key is missing, the route returns 503 and the interface says critique is off. The app does not imitate a model response.
 

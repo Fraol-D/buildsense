@@ -1,6 +1,8 @@
+import { ApiError, GoogleGenAI } from "@google/genai";
 import { z } from "zod";
 
-export const DEFAULT_MODEL = "grok-4.7";
+/** Stable Gemini Flash model for structured critique. Override with GEMINI_MODEL. */
+export const DEFAULT_MODEL = "gemini-3.8-flash";
 
 export const COACH_SYSTEM_PROMPT = `You are the critique partner inside Buildsense, an engineering coach for people building software with coding agents.
 
@@ -13,11 +15,12 @@ Rules:
 - Make at most five suggestions. Each one must say why it matters to this specific project.
 - Keep the commentary to at most two short paragraphs.`;
 
+/** Keywords limited to those Gemini's responseJsonSchema accepts. Length limits are enforced with Zod. */
 export const CRITIQUE_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
-    commentary: { type: "string", maxLength: 1600 },
+    commentary: { type: "string" },
     suggestions: {
       type: "array",
       maxItems: 5,
@@ -26,9 +29,9 @@ export const CRITIQUE_JSON_SCHEMA = {
         additionalProperties: false,
         properties: {
           kind: { type: "string", enum: ["open_question", "assumption", "risk", "probe"] },
-          text: { type: "string", maxLength: 400 },
+          text: { type: "string" },
           impact: { type: "string", enum: ["high", "medium", "low"] },
-          why: { type: "string", maxLength: 400 },
+          why: { type: "string" },
         },
         required: ["kind", "text", "impact", "why"],
       },
@@ -54,16 +57,46 @@ const requestSchema = z.object({
   context: z.string().trim().min(1).max(12000),
 });
 
+export interface GenerateCritiqueInput {
+  apiKey: string;
+  model: string;
+  systemInstruction: string;
+  contents: string;
+  abortSignal: AbortSignal;
+}
+
+export type CritiqueGenerator = (input: GenerateCritiqueInput) => Promise<string>;
+
 export interface CoachEnv {
   apiKey?: string;
   model?: string;
-  fetchImpl?: typeof fetch;
+  /** Test seam. Production uses the Gemini SDK. */
+  generate?: CritiqueGenerator;
 }
 
 export interface CoachResponse {
   status: number;
   body: Record<string, unknown>;
 }
+
+const REQUEST_TIMEOUT_MS = 30_000;
+
+export const generateWithGemini: CritiqueGenerator = async (input) => {
+  const ai = new GoogleGenAI({ apiKey: input.apiKey });
+  const response = await ai.models.generateContent({
+    model: input.model,
+    contents: input.contents,
+    config: {
+      systemInstruction: input.systemInstruction,
+      temperature: 0.2,
+      maxOutputTokens: 2048,
+      responseMimeType: "application/json",
+      responseJsonSchema: CRITIQUE_JSON_SCHEMA,
+      abortSignal: input.abortSignal,
+    },
+  });
+  return response.text ?? "";
+};
 
 export function parseCritique(content: string): z.infer<typeof critiqueSchema> | null {
   const stripped = content.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
@@ -75,110 +108,88 @@ export function parseCritique(content: string): z.infer<typeof critiqueSchema> |
   }
 }
 
+function failure(status: number, error: string, message: string): CoachResponse {
+  return { status, body: { error, message } };
+}
+
+function isAbort(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("name" in error)) return false;
+  const name = String((error as { name: unknown }).name);
+  return name === "AbortError" || name === "TimeoutError";
+}
+
+function statusCode(error: unknown): number | undefined {
+  if (error instanceof ApiError) return error.status;
+  if (error && typeof error === "object" && "status" in error && typeof (error as { status: unknown }).status === "number") {
+    return (error as { status: number }).status;
+  }
+  return undefined;
+}
+
+function providerFailure(error: unknown): CoachResponse {
+  if (isAbort(error)) {
+    return failure(502, "model_unreachable", "The model request did not complete. Nothing was changed.");
+  }
+  const code = statusCode(error);
+  const raw = error instanceof Error ? error.message : "";
+  const rejectedKey = code === 401 || code === 403 || (code === 400 && /api key/i.test(raw));
+  if (rejectedKey) {
+    return failure(401, "invalid_api_key", "Gemini rejected the API key. Check GEMINI_API_KEY. Nothing was changed.");
+  }
+  if (code === 429 || /RESOURCE_EXHAUSTED|quota exceeded|rate limit/i.test(raw)) {
+    return failure(429, "rate_limited", "Gemini rate limit or quota was reached. Nothing was changed.");
+  }
+  const suffix = code ? ` (${code})` : "";
+  return failure(502, "model_request_failed", `The model request failed${suffix}. Nothing was changed.`);
+}
+
 export async function handleCoachRequest(raw: string, env: CoachEnv): Promise<CoachResponse> {
   if (raw.length > 20000) {
-    return {
-      status: 413,
-      body: { error: "payload_too_large", message: "The critique request is too large. Nothing was changed." },
-    };
+    return failure(413, "payload_too_large", "The critique request is too large. Nothing was changed.");
   }
   let json: unknown;
   try {
     json = JSON.parse(raw);
   } catch {
-    return { status: 400, body: { error: "invalid_json", message: "The request was not valid JSON." } };
+    return failure(400, "invalid_json", "The request was not valid JSON.");
   }
   const request = requestSchema.safeParse(json);
   if (!request.success) {
-    return {
-      status: 400,
-      body: { error: "invalid_request", message: "A task and a bounded context are required. Nothing was changed." },
-    };
+    return failure(400, "invalid_request", "A task and a bounded context are required. Nothing was changed.");
   }
   if (!env.apiKey) {
-    return {
-      status: 503,
-      body: {
-        error: "model_not_configured",
-        message:
-          "Model critique is off. Set XAI_API_KEY for the server. The discovery, decision, brief, and verification workflow does not need a model.",
-      },
-    };
+    return failure(
+      503,
+      "model_not_configured",
+      "Model critique is off. Set GEMINI_API_KEY for the server. The discovery, decision, brief, and verification workflow does not need a model.",
+    );
   }
 
   const model = env.model?.trim() || DEFAULT_MODEL;
-  const fetchImpl = env.fetchImpl ?? fetch;
-  let response: Response;
-  try {
-    response = await fetchImpl("https://api.x.ai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: COACH_SYSTEM_PROMPT },
-          { role: "user", content: `Task: ${request.data.task}\n\n${request.data.context}` },
-        ],
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "coach_critique",
-            strict: true,
-            schema: CRITIQUE_JSON_SCHEMA,
-          },
-        },
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-  } catch {
-    return {
-      status: 502,
-      body: { error: "model_unreachable", message: "The model request did not complete. Nothing was changed." },
-    };
-  }
-
-  const responseText = await response.text();
-  if (env.apiKey && responseText.includes(env.apiKey)) {
-    return {
-      status: 502,
-      body: { error: "model_request_failed", message: "The model response was discarded. Nothing was changed." },
-    };
-  }
-  if (!response.ok) {
-    return {
-      status: 502,
-      body: {
-        error: "model_request_failed",
-        message: `The model request failed (${response.status}). Nothing was changed.`,
-      },
-    };
-  }
-
+  const generate = env.generate ?? generateWithGemini;
   let content = "";
   try {
-    const payload = JSON.parse(responseText) as {
-      choices?: { message?: { content?: string | null } }[];
-    };
-    content = payload.choices?.[0]?.message?.content ?? "";
-  } catch {
-    return {
-      status: 422,
-      body: { error: "model_output_invalid", message: "The model response was not usable. Nothing was changed." },
-    };
+    content = await generate({
+      apiKey: env.apiKey,
+      model,
+      systemInstruction: COACH_SYSTEM_PROMPT,
+      contents: `Task: ${request.data.task}\n\n${request.data.context}`,
+      abortSignal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    return providerFailure(error);
+  }
+
+  if (content.includes(env.apiKey)) {
+    return failure(502, "model_request_failed", "The model response was discarded. Nothing was changed.");
   }
   const critique = parseCritique(content);
   if (!critique) {
-    return {
-      status: 422,
-      body: {
-        error: "model_output_invalid",
-        message: "The model response did not match the critique schema. Nothing was changed.",
-      },
-    };
+    return failure(
+      422,
+      "model_output_invalid",
+      "The model response did not match the critique schema. Nothing was changed.",
+    );
   }
   return { status: 200, body: { available: true, critique } };
 }
@@ -189,6 +200,6 @@ export function modelStatus(env: { apiKey?: string; model?: string }) {
     persistence: "browser-local" as const,
     modelConfigured: configured,
     model: configured ? env.model?.trim() || DEFAULT_MODEL : null,
-    provider: "xai" as const,
+    provider: "gemini" as const,
   };
 }
