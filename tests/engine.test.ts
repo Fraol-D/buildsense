@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "@google/genai";
-import { DEFAULT_MODEL, handleCoachRequest, parseCritique, type GenerateCritiqueInput } from "@/lib/ai/coach";
+import {
+  DEFAULT_MODEL,
+  geminiRequestConfig,
+  handleCoachRequest,
+  parseCritique,
+  type GenerateCritiqueInput,
+  type ProviderFailureLog,
+} from "@/lib/ai/coach";
 import type { EngineOptions, Project } from "@/lib/domain/types";
 import { generateBriefs } from "@/lib/engine/briefs";
 import { generateDecisions } from "@/lib/engine/decisions";
@@ -241,6 +248,12 @@ const validCritique = JSON.stringify({
   ],
 });
 
+const quiet = { sleep: async () => {}, log: () => {} };
+
+function providerError(status: number, message: string) {
+  return new ApiError({ status, message });
+}
+
 describe("Gemini critique boundary", () => {
   it("stays unavailable without a key and does not invent a critique", async () => {
     let called = false;
@@ -262,16 +275,19 @@ describe("Gemini critique boundary", () => {
     const secret = "gemini-test-secret-value";
     const leaked = await handleCoachRequest(JSON.stringify({ task: "review_evidence", context: "Evidence pasted by the user." }), {
       apiKey: secret,
+      ...quiet,
       generate: async () => {
         throw new ApiError({ message: `request failed for ${secret}`, status: 500 });
       },
     });
-    expect(leaked.status).toBe(502);
+    expect(leaked.status).toBe(500);
+    expect(leaked.body.error).toBe("provider_error");
     expect(leaked.body).not.toHaveProperty("critique");
     expect(JSON.stringify(leaked.body)).not.toContain(secret);
 
     const quota = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
       apiKey: secret,
+      ...quiet,
       generate: async () => {
         throw new ApiError({ message: "RESOURCE_EXHAUSTED", status: 429 });
       },
@@ -282,6 +298,7 @@ describe("Gemini critique boundary", () => {
 
     const invalid = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
       apiKey: secret,
+      ...quiet,
       generate: async () => {
         throw new ApiError({ message: "API key not valid", status: 400 });
       },
@@ -292,6 +309,7 @@ describe("Gemini critique boundary", () => {
 
     const rejected = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
       apiKey: secret,
+      ...quiet,
       generate: async () => {
         throw new ApiError({ message: "permission denied", status: 403 });
       },
@@ -301,6 +319,7 @@ describe("Gemini critique boundary", () => {
 
     const timedOut = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
       apiKey: secret,
+      ...quiet,
       generate: async () => {
         const error = new Error("The operation was aborted");
         error.name = "TimeoutError";
@@ -330,6 +349,9 @@ describe("Gemini critique boundary", () => {
     });
     expect(seen?.model).toBe(DEFAULT_MODEL);
     expect(seen?.model).toBe("gemini-3.8-flash");
+    const requestConfig = geminiRequestConfig(seen!);
+    expect(requestConfig.config.httpOptions?.retryOptions?.attempts).toBe(1);
+    expect(requestConfig.model).toBe("gemini-3.8-flash");
     expect(seen?.systemInstruction).toContain("Never say that a requirement is verified");
     expect(seen?.apiKey).toBe("test-key");
     expect(response.status).toBe(200);
@@ -348,5 +370,132 @@ describe("Gemini critique boundary", () => {
     expect(response.status).toBe(502);
     expect(JSON.stringify(response.body)).not.toContain(secret);
     expect(response.body).not.toHaveProperty("critique");
+  });
+
+  it("retries temporary Gemini overload and then reports the provider reason", async () => {
+    const secret = "gemini-test-secret-value";
+    const projectToken = "PRIVATE-PROJECT-TOKEN-do-not-log";
+    const highDemand = {
+      error: {
+        code: 503,
+        message: "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+        status: "UNAVAILABLE",
+        details: `${secret} ${projectToken}`,
+      },
+    };
+    let calls = 0;
+    const delays: number[] = [];
+    const logs: ProviderFailureLog[] = [];
+    const exhausted = await handleCoachRequest(JSON.stringify({ task: "critique_decisions", context: projectToken }), {
+      apiKey: secret,
+      model: "gemini-3.8-flash",
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+      log: (entry) => logs.push(entry),
+      generate: async () => {
+        calls += 1;
+        throw providerError(503, JSON.stringify(highDemand));
+      },
+    });
+    expect(calls).toBe(3);
+    expect(delays).toEqual([500, 1000]);
+    expect(exhausted.status).toBe(503);
+    expect(exhausted.body.error).toBe("provider_unavailable");
+    expect(exhausted.body.message).toContain("high demand");
+    expect(exhausted.body.message).not.toContain("..");
+    expect(exhausted.body.message).toContain("Nothing was changed");
+    expect(exhausted.body.message).not.toBe("The model request failed (503). Nothing was changed.");
+    expect(exhausted.body).not.toHaveProperty("critique");
+    expect(JSON.stringify(exhausted.body)).not.toContain(secret);
+    expect(JSON.stringify(exhausted.body)).not.toContain(projectToken);
+    expect(JSON.stringify(logs)).toContain("UNAVAILABLE");
+    expect(JSON.stringify(logs)).toContain("high demand");
+    expect(JSON.stringify(logs)).not.toContain(secret);
+    expect(JSON.stringify(logs)).not.toContain(projectToken);
+    expect(logs.every((entry) => entry.retrying === entry.attempt < 3)).toBe(true);
+
+    calls = 0;
+    const recovered = await handleCoachRequest(JSON.stringify({ task: "probe", context: projectToken }), {
+      apiKey: secret,
+      ...quiet,
+      generate: async () => {
+        calls += 1;
+        if (calls < 3) throw providerError(503, JSON.stringify(highDemand));
+        return validCritique;
+      },
+    });
+    expect(calls).toBe(3);
+    expect(recovered.status).toBe(200);
+    expect(recovered.body).toHaveProperty("critique");
+    expect(JSON.stringify(recovered.body)).not.toContain(projectToken);
+
+    calls = 0;
+    const timedOutAfterOverload = await handleCoachRequest(JSON.stringify({ task: "probe", context: projectToken }), {
+      apiKey: secret,
+      ...quiet,
+      generate: async () => {
+        calls += 1;
+        if (calls === 1) throw providerError(503, JSON.stringify(highDemand));
+        const error = new Error("The operation was aborted");
+        error.name = "TimeoutError";
+        throw error;
+      },
+    });
+    expect(calls).toBe(2);
+    expect(timedOutAfterOverload.status).toBe(503);
+    expect(timedOutAfterOverload.body.error).toBe("provider_unavailable");
+    expect(timedOutAfterOverload.body.message).toContain("high demand");
+    expect(timedOutAfterOverload.body).not.toHaveProperty("critique");
+    expect(JSON.stringify(timedOutAfterOverload.body)).not.toContain(projectToken);
+  });
+
+  it("does not retry invalid models, rejected credentials, or malformed requests", async () => {
+    const secret = "gemini-test-secret-value";
+    const cases = [
+      {
+        error: providerError(404, JSON.stringify({ error: { code: 404, message: "models/gemini-bogus is not found", status: "NOT_FOUND" } })),
+        model: "gemini-bogus",
+        status: 404,
+        code: "invalid_model",
+      },
+      {
+        error: providerError(400, JSON.stringify({ error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } })),
+        model: DEFAULT_MODEL,
+        status: 401,
+        code: "invalid_api_key",
+      },
+      {
+        error: providerError(400, JSON.stringify({ error: { code: 400, message: "Request contains an invalid argument.", status: "INVALID_ARGUMENT" } })),
+        model: DEFAULT_MODEL,
+        status: 400,
+        code: "malformed_request",
+      },
+      {
+        error: providerError(429, JSON.stringify({ error: { code: 429, message: "You exceeded your current quota, please check your plan and billing details.", status: "RESOURCE_EXHAUSTED" } })),
+        model: DEFAULT_MODEL,
+        status: 429,
+        code: "quota_exceeded",
+        attempts: 3,
+      },
+    ];
+    for (const item of cases) {
+      let calls = 0;
+      const response = await handleCoachRequest(JSON.stringify({ task: "probe", context: "A short project context." }), {
+        apiKey: secret,
+        model: item.model,
+        ...quiet,
+        generate: async () => {
+          calls += 1;
+          throw item.error;
+        },
+      });
+      expect(calls).toBe(item.attempts ?? 1);
+      expect(response.status).toBe(item.status);
+      expect(response.body.error).toBe(item.code);
+      expect(response.body).not.toHaveProperty("critique");
+      expect(JSON.stringify(response.body)).not.toContain(secret);
+      expect(String(response.body.message)).toContain("Nothing was changed");
+    }
   });
 });

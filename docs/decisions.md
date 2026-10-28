@@ -33,7 +33,7 @@ Release readiness is one of four named judgments. There is no confidence score.
 
 When `GEMINI_API_KEY` is set, `/api/coach` calls the Gemini API through the `@google/genai` SDK. The default model is `gemini-3.8-flash` unless `GEMINI_MODEL` overrides it. The key stays on the server. Output must match the critique schema and is validated with Zod before it reaches the client. Suggestions are added to the record only when the user accepts them, and they are labeled as model critique rather than facts.
 
-If the key is missing, the route returns 503 and the interface says critique is off. The app does not imitate a model response.
+If the key is missing, the route returns 503 `model_not_configured` and the interface says critique is off. The app does not imitate a model response. A configured call that fails is classified instead of collapsed into that same message: temporary overload stays 503, rate limit and quota stay 429, rejected credentials stay 401, an unknown model id stays 404, and a rejected request stays 400. Transient 429, 408, and 5xx responses are retried up to three attempts with exponential backoff. The SDK's own five-attempt retry is turned off so a 503 is not held until the 30-second deadline and reported as a timeout. The route never writes decisions or verification records. A failed critique returns no suggestion, so approved decisions and verification status stay as they were.
 
 ## Stack
 
